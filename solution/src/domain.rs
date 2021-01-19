@@ -97,12 +97,6 @@ pub struct SystemCommandHeader {
     pub sector_idx: SectorIdx,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SystemMessageMetadata {
-    pub process_identifier: u8,
-    pub msg_ident: Uuid,
-}
-
 #[derive(Debug, Clone)]
 pub struct OperationComplete {
     pub status_code: StatusCode,
