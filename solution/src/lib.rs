@@ -7,7 +7,7 @@ pub use sectors_manager_public::*;
 pub use stable_storage_public::*;
 pub use transfer_public::*;
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::prelude::*;
 use tokio::sync::Mutex;
@@ -18,6 +18,12 @@ type HmacSha256 = Hmac<Sha256>;
 use crate::{RegisterCommand::Client, RegisterCommand::System};
 
 use std::sync::{Arc};
+use uuid::Uuid;
+use tokio::time::{Duration, interval};
+use std::collections::HashMap;
+use std::sync::Condvar;
+use tokio::sync::Notify;
+
 
 fn does_end_with_magic(v : &Vec<u8>) -> bool {
     if v.len() < 4 {
@@ -28,14 +34,6 @@ fn does_end_with_magic(v : &Vec<u8>) -> bool {
     }
     return false;
 }
-
-// fn network_to_normal(num : u8) -> u8 {
-//     u8::from_be_bytes([num])
-// }
-
-// fn normal_to_network(num : u8) -> u8 {
-//     (num.to_be_bytes())[0]
-// }
 
 // code shift == 1 <=> operation is READ
 // code shift == 2 <=> operation is WRITE
@@ -65,127 +63,233 @@ fn client_response_to_u8(operation : OperationComplete, code_shift : u8, public_
     return buffer;
 }
 
+fn ack_to_u8(uuid : Uuid) -> Vec<u8> {
+    let mut ans = Vec::new();
+    ans.extend(MAGIC_NUMBER.iter()); // MAGIC NUMBER
+    for _ in 0..3 {
+        ans.push(0); // PADDING
+    }
+    ans.push(0x81); // ACK
+    ans.extend(uuid.as_bytes());
+    ans
+}
+
+const WORKER_COUNT : usize = 256;
 
 pub async fn run_register_process(config: Configuration) {
-    let stab_stor = build_stable_storage(config.public.storage_dir.clone()).await;
-    let register_client = build_register_client(config.hmac_system_key, config.hmac_client_key, config.public.tcp_locations.clone());
-    let sectors_manager = build_sectors_manager(config.public.storage_dir);
-
-    let (register, _) = build_atomic_register(config.public.self_rank, stab_stor, register_client , sectors_manager, config.public.tcp_locations.len()).await;
-
+    // Listening on some port
     let parts = &config.public.tcp_locations[config.public.self_rank as usize - 1];
     let address = parts.0.clone() + ":" + &parts.1.to_string(); 
-
     let listener = TcpListener::bind(address.clone()).await.unwrap();
-    let register_packed = Arc::new(Mutex::new(register));
 
-    loop {
 
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let public_key = config.hmac_client_key.clone();
-        // Process each socket concurrently.
-        let register_clone = register_packed.clone();
-        tokio::spawn(async move {
+    let mut sector_dir = config.public.storage_dir.clone();
+    sector_dir.push("sector_manager");
+    let sectors_manager = build_sectors_manager(sector_dir);
 
-            let mut trash : Vec<u8> = Vec::new();
-            while !does_end_with_magic(&trash) {
-                let mut new_byte = [0 as u8];
-                socket.read_exact(&mut new_byte).await.unwrap(); 
-                trash.push(new_byte[0]);
-            }        
-            let mut rest = [0 as u8; 4]; 
-            socket.read_exact(&mut rest).await.unwrap();
+    let mut workers = Arc::new(Vec::new());
+
+    let register_client = build_register_client(config.hmac_system_key, config.hmac_client_key, config.public.tcp_locations.clone());
+
+    for i in 0..WORKER_COUNT {
+        let mut path_to_another_register = config.public.storage_dir.clone();
+        path_to_another_register.push(i.to_string());
+        let stab_stor = build_stable_storage(path_to_another_register).await;
+
+        let (register, _) = build_my_atomic_register(config.public.self_rank, stab_stor, register_client.clone() , sectors_manager.clone(), config.public.tcp_locations.len()).await;
+
+        Arc::get_mut(&mut workers).unwrap().push(Arc::new(Mutex::new(register)));
+    }
+    // Here we will spawn a proccess that is responsible for resending messages which were possibly not delivered to the other process 
+    let pkey = config.hmac_client_key.clone();
+    let max_sector = config.public.max_sector;
+    let reg_clone = register_client.clone();
+
+    let rank = config.public.self_rank.clone();
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            // I'm doing it this way so we will not deadlock on send
             
-            let mut whole_msg : Vec<u8> = Vec::new();
-            whole_msg.extend(MAGIC_NUMBER.iter());
-            whole_msg.extend(rest.iter());
-
-            let msg_type = rest[3];
-            match msg_type { // MSG TYPE
-                1 => { // READ
-                    let mut rest_of_the_message = [0 as u8; 8 + 8];
-                    socket.read_exact(&mut rest_of_the_message).await.unwrap();        
-                    whole_msg.extend(rest_of_the_message.iter());
-                }
-                2 => { // WRITE
-                    let mut rest_of_the_message = [0 as u8; 8 + 8 + 4096];
-                    socket.read_exact(&mut rest_of_the_message).await.unwrap();        
-                    whole_msg.extend(rest_of_the_message.iter());
-                }
-                3 => { // READ_PROC
-                    let mut rest_of_the_message = [0 as u8; 16 + 8 + 8];
-                    socket.read_exact(&mut rest_of_the_message).await.unwrap();        
-                    whole_msg.extend(rest_of_the_message.iter());
-                }
-                4 => { // VALUE
-                    let mut rest_of_the_message = [0 as u8; 16 + 8 + 8 + 8 + 8 + 4096];
-                    socket.read_exact(&mut rest_of_the_message).await.unwrap();        
-                    whole_msg.extend(rest_of_the_message.iter());
-                }
-                5 => { // WRITE_PROC
-                    let mut rest_of_the_message = [0 as u8; 16 + 8 + 8 + 8 + 8 + 4096];
-                    socket.read_exact(&mut rest_of_the_message).await.unwrap();        
-                    whole_msg.extend(rest_of_the_message.iter());
-                }
-                6 => { // ACK
-                    let mut rest_of_the_message = [0 as u8; 16 + 8 + 8];
-                    socket.read_exact(&mut rest_of_the_message).await.unwrap();        
-                    whole_msg.extend(rest_of_the_message.iter());
-                }
-                _ => { 
-                    // TODO unknown cmd
+            let mut messages = Vec::new();
+            {
+                let inside = &*reg_clone.unanswered_messages.lock().await;
+                println!("Got {:?} messages in {:?}", inside.len(), rank);
+                for (key, message) in &*inside {
+                    messages.push((key.clone(), message.clone()));
                 }
             }
-            let mut supposed_hmac = [0 as u8; 32];
-            socket.read_exact(&mut supposed_hmac).await.unwrap();
+            for (_, message) in &*messages {
+                println!("Retransmission...");
+                reg_clone.send(message.clone()).await;
+            }
+        }
+    });
 
-            let mut mac = HmacSha256::new_varkey(&public_key).unwrap();
-            mac.update(&whole_msg);
-            let mut msg_as_array : &[u8] = &whole_msg;
-            let cmd = deserialize_register_command(&mut msg_as_array);
-            match cmd {
-                Ok(Client(client_cmd)) => {
-                    let req_id = client_cmd.header.request_identifier;
-                    if !mac.verify(supposed_hmac.as_ref()).is_ok() {
-                        socket.write_all(&client_response_to_u8(OperationComplete {
-                            status_code : StatusCode::AuthFailure,
-                            request_identifier : req_id,
-                            op_return : (match msg_type {
-                                1 => OperationReturn::Read(ReadReturn{read_data : None}),
-                                _ => OperationReturn::Write,
-                                // _ => panic!(),
-                            }) 
-                        }, 
-                        msg_type, public_key)).await.unwrap();
-                    }
-                    // let answer = Arc::new((NormalMutex::new(None), Condvar::new()));
-                    // let clone = answer.clone();
-                    register_clone.lock().await.client_command(client_cmd, Box::new(
-                        move |op_complete| {
-                            // let newsock = socket.into_std().unwrap();
-                            socket.into_std().unwrap().write_all(&client_response_to_u8(op_complete, msg_type, public_key)).unwrap();
-                            // let (my_mutex, condvar) = &*clone;
-                            // let mut guard = my_mutex.lock().unwrap();
-                            // *guard = Some(op_complete);
-                            // condvar.notify_one();
+
+    loop {
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let workers_clone = workers.clone();
+        let sender_clone = register_client.clone();
+        let public_key = pkey.clone();
+        let system_key = config.hmac_system_key.clone();
+
+        // Process each socket concurrently.
+        tokio::spawn(async move {
+            let socket_std = socket.into_std().unwrap();
+            let socket_cloned = socket_std.try_clone().unwrap();
+
+            let mut copied_socket = TcpStream::from_std(socket_cloned).unwrap();
+            loop {
+                let mut trash : Vec<u8> = Vec::new();
+                while !does_end_with_magic(&trash) {
+                    let mut new_byte = [0 as u8];
+                    match copied_socket.read_exact(&mut new_byte).await {
+                        Ok(_) => {}
+                        Err(_) => {
+                            return;
                         }
-                    )).await;
+                    }; 
+                    trash.push(new_byte[0]);
+                }       
+                let mut rest = [0 as u8; 4]; 
+                copied_socket.read_exact(&mut rest).await.unwrap();
+                
+                let mut whole_msg : Vec<u8> = Vec::new();
+                whole_msg.extend(MAGIC_NUMBER.iter());
+                whole_msg.extend(rest.iter());
 
-                    // let (my_mutex, condvar) = &*answer;
-                    // let mut guard = my_mutex.lock().unwrap();
-                    // while guard.is_none() {
-                    //     guard = condvar.wait(guard).unwrap();
-                    // } 
-                    // match guard.clone() {
-                    //     Some(response) => {socket.write_all(&client_response_to_u8(response, msg_type));},
-                    //     _ => {},
-                    // }
+                let msg_type = rest[3];
+                match msg_type { // MSG TYPE
+                    1 => { // READ
+                        let mut rest_of_the_message = [0 as u8; 8 + 8];
+                        copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
+                        whole_msg.extend(rest_of_the_message.iter());
+                    }
+                    2 => { // WRITE
+                        let mut rest_of_the_message = [0 as u8; 8 + 8 + 4096];
+                        copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
+                        whole_msg.extend(rest_of_the_message.iter());
+                    }
+                    3 => { // READ_PROC
+                        let mut rest_of_the_message = [0 as u8; 16 + 8 + 8];
+                        copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
+                        whole_msg.extend(rest_of_the_message.iter());
+                    }
+                    4 => { // VALUE
+                        let mut rest_of_the_message = [0 as u8; 16 + 8 + 8 + 8 + 8 + 4096];
+                        copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
+                        whole_msg.extend(rest_of_the_message.iter());
+                    }
+                    5 => { // WRITE_PROC
+                        let mut rest_of_the_message = [0 as u8; 16 + 8 + 8 + 8 + 8 + 4096];
+                        copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
+                        whole_msg.extend(rest_of_the_message.iter());
+                    }
+                    6 => { // ACK
+                        let mut rest_of_the_message = [0 as u8; 16 + 8 + 8];
+                        copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
+                        whole_msg.extend(rest_of_the_message.iter());
+                    }
+                    0x81 => { // MESSAGE WAS DELIVERED;
+                        let mut rest_of_the_message = [0 as u8; 16];
+                        copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
+                        whole_msg.extend(rest_of_the_message.iter());
 
-                },
-                Ok(System(system_cmd)) => {
-                    register_clone.lock().await.system_command(system_cmd).await;
-                },
-                Err(_) => {},
+                        let mut supposed_hmac = [0 as u8; 32];
+                        copied_socket.read_exact(&mut supposed_hmac).await.unwrap();
+
+                        let mut mac = HmacSha256::new_varkey(&system_key).unwrap();
+                        mac.update(&whole_msg);
+
+                        if mac.verify(supposed_hmac.as_ref()).is_ok() {
+                            sender_clone.unanswered_messages.lock().await.remove(&Uuid::from_bytes(rest_of_the_message));
+                        }
+                        return;
+                    }
+                    _ => { 
+                        return;
+                        // TODO unknown cmd
+                    }
+                }
+                let mut supposed_hmac = [0 as u8; 32];
+                copied_socket.read_exact(&mut supposed_hmac).await.unwrap();
+
+                let mut mac = HmacSha256::new_varkey(&public_key).unwrap();
+                mac.update(&whole_msg);
+                let mut msg_as_array : &[u8] = &whole_msg;
+                let cmd = deserialize_register_command(&mut msg_as_array);
+                match cmd {
+                    Ok(Client(client_cmd)) => {
+                        let req_id = client_cmd.header.request_identifier;
+                        if !mac.verify(supposed_hmac.as_ref()).is_ok() {
+                            copied_socket.write_all(&client_response_to_u8(OperationComplete {
+                                status_code : StatusCode::AuthFailure,
+                                request_identifier : req_id,
+                                op_return : (match msg_type {
+                                    1 => OperationReturn::Read(ReadReturn{read_data : None}),
+                                    _ => OperationReturn::Write,
+                                }) 
+                            }, 
+                            msg_type, public_key)).await.unwrap();
+                            return;
+                        }
+                        if client_cmd.header.sector_idx >= max_sector || client_cmd.header.sector_idx < 0 {
+                            copied_socket.write_all(&client_response_to_u8(OperationComplete {
+                                status_code : StatusCode::InvalidSectorIndex,
+                                request_identifier : req_id,
+                                op_return : (match msg_type {
+                                    1 => OperationReturn::Read(ReadReturn{read_data : None}),
+                                    _ => OperationReturn::Write,
+                                }) 
+                            }, 
+                            msg_type, public_key)).await.unwrap();
+                            return;
+                        } 
+                        let sector_id = client_cmd.header.sector_idx;
+                        let index = WORKER_COUNT as usize * (sector_id as usize /  max_sector as usize);
+                        let which_register = workers_clone.get(index).unwrap(); // TODO Work out a better strategy
+                        // let which_register = workers_clone.get(0).unwrap();
+
+                        let mut notifier;
+                        {
+                            let mut lock = which_register.lock().await;
+                            if !lock.metadata.contains_key(&sector_id) {
+                                lock.generate_metadata(sector_id).await;
+                            }
+                            let normal = &lock.metadata.get(&sector_id).unwrap().notifier;
+                            notifier = normal.clone();
+                        }
+                        notifier.notified().await;
+                        
+                        println!("-------------WE'RE INVOKING CLIENT COMMAND-------------");
+                        let mut socket_super_cloned = socket_std.try_clone().unwrap();
+                        which_register.lock().await.client_command(client_cmd, Box::new(
+                            move |op_complete| {
+                                println!("--------------CALLBACK INVOKED--------------");
+                                socket_super_cloned.write_all(&client_response_to_u8(op_complete, msg_type, public_key)).unwrap();
+                                notifier.notify_one();
+                            }
+                        )).await;
+
+                    },
+                    Ok(System(system_cmd)) => {
+                        let index = WORKER_COUNT as usize * (system_cmd.header.sector_idx as usize /  max_sector as usize);
+                        let target = system_cmd.header.process_identifier.clone() as usize;
+                        let which_register = workers_clone.get(index).unwrap(); // TODO Work out a better strategy
+                        // let which_register = workers_clone.get(0).unwrap();
+                        let uuid = system_cmd.header.msg_ident.clone();
+                        {                        
+                            let mut lock = which_register.lock().await;
+                            lock.system_command(system_cmd).await;
+                        }
+                        // After that we need to write ackowledgement
+                        sender_clone.send_raw_bytes_no_ack(ack_to_u8(uuid), target).await;
+                    },
+                    Err(_) => {},
+                }
             }
         });
     } 
@@ -206,6 +310,7 @@ pub mod atomic_register_public {
     use std::sync::Arc;
     use uuid::Uuid;
     use std::collections::{HashMap, HashSet};
+    use tokio::sync::{Mutex, Notify};
 
     #[async_trait::async_trait]
     pub trait AtomicRegister: core::marker::Send + core::marker::Sync {
@@ -221,8 +326,11 @@ pub mod atomic_register_public {
         /// Send system command to the register.
         async fn system_command(&mut self, cmd: SystemRegisterCommand);
     }
-
-    struct MyAtomicRegister {
+    pub struct AtomicRegisterMetadata {
+        ts : u64,
+        wr : u8,
+        val : SectorVec,
+        
         rid : u64,
         readlist : HashMap <u8, (u64, u8, SectorVec)>, // Timestamp, rank, value
         acklist : HashSet<u8>,
@@ -230,19 +338,49 @@ pub mod atomic_register_public {
         writing : bool,
         write_val : SectorVec,
         read_val : SectorVec,
+        pub notifier : Arc<Notify>,
+    }
+
+    pub struct MyAtomicRegister {
         proc_count : usize,
         register_client : Arc <dyn RegisterClient>,
         id : u8,
 
-        // ts : u64,
-        // wr : u8,
-        // val : SectorVec,
-        // self_rank : u8,
-
         stable_storage : Box <dyn StableStorage>,
         sector_manager : Arc <dyn SectorsManager>,
-        callbacks : HashMap<u64, Box<dyn FnOnce(OperationComplete) + Send + Sync> >,
-        request_ids : HashMap<u64, u64>
+        callbacks : HashMap<(u64, u64), Box<dyn FnOnce(OperationComplete) + Send + Sync> >,
+        request_ids : HashMap<(u64, u64), u64>,
+        pub metadata : HashMap<u64, AtomicRegisterMetadata>,
+    }
+    
+    // #[async_trait::async_trait]
+    impl MyAtomicRegister {
+        fn incr_rid(&mut self, idx : u64) {
+            // self.metadata.get_mut(&idx).unwrap().rid += WORKER_COUNT as u64;
+            self.metadata.get_mut(&idx).unwrap().rid += 1 as u64;
+        }
+        pub async fn generate_metadata(&mut self, idx : u64) {
+            self.metadata.insert(idx, AtomicRegisterMetadata {
+                ts : 0 as u64,
+                wr : 0 as u8,
+                val : empty_ans(),
+
+                rid : 0,
+                readlist : HashMap::new(),
+                acklist : HashSet::new(),
+                reading : false,
+                writing : false,
+                write_val : empty_ans(),  
+                read_val : empty_ans(),
+                notifier : Arc::new(Notify::new()),
+            });
+            self.metadata.get(&idx).unwrap().notifier.notify_one();
+            let mut all_sectors = Vec::new();
+            for (key, _) in &self.metadata {
+                all_sectors.push(key);
+            }
+            self.stable_storage.put("all_sectors", &bincode::serialize(&all_sectors).unwrap()).await.unwrap();
+        }
     }
 
     fn u8_to_bool(x : u8) -> bool {
@@ -265,14 +403,16 @@ pub mod atomic_register_public {
         let mut high_ts = 0 as u64;
         let mut high_rr = 0 as u8;
         let mut high_val : SectorVec = SectorVec(Vec::new());
+        let mut first_iter = true;
         for (_, val) in readlist {
             let ts = val.0;
             let rr = val.1;
-            if ts > high_ts || (ts == high_ts && rr > high_rr) {
+            if ts > high_ts || (ts == high_ts && rr > high_rr) || first_iter {
                 high_ts = ts;
                 high_rr = rr;
                 high_val = val.2.clone();
             }
+            first_iter = false;
         }
         (high_ts, high_rr, high_val)
     } 
@@ -282,7 +422,7 @@ pub mod atomic_register_public {
             return None;
         }
         let mut arr = [0 as u8; 8];
-        for i in 0..7 {
+        for i in 0..8 {
             arr[i] = vec[i];
         }
         return Some(arr);
@@ -290,60 +430,69 @@ pub mod atomic_register_public {
 
     impl MyAtomicRegister {
         async fn restore_and_get(&mut self) -> Option<ClientRegisterCommand> {
-            let maybe_rid = self.stable_storage.get("rid").await;
-            match maybe_rid {
-                Some(data) => {
-                    match vec_to_arr8(data) {
-                        Some(arr) => {self.rid = u64::from_be_bytes(arr);},
-                        _ => {}
+            let maybe_sectors = self.stable_storage.get("all_sectors").await;
+            match maybe_sectors {
+                Some(all_sectors_serialized) => {
+                    let all_sectors : Vec <u64> = bincode::deserialize(&all_sectors_serialized).unwrap();
+
+                    let mut writing = false;
+                    let mut write_data = Vec::new();
+
+                    for sector in all_sectors {
+                        let maybe_rid = self.stable_storage.get(&("rid_".to_owned() + &sector.to_string())).await;
+                        match maybe_rid {
+                            Some(data) => {
+                                match vec_to_arr8(data) {
+                                    Some(arr) => {self.metadata.get_mut(&sector).unwrap().rid = u64::from_be_bytes(arr);},
+                                    _ => {}
+                                }
+                            },
+                            _ => {}
+                        }
+
+                        let maybe_write_val = self.stable_storage.get(&("write_val_".to_owned() + &sector.to_string())).await;
+                        match maybe_write_val {
+                            Some(data) => {
+                                self.metadata.get_mut(&sector).unwrap().write_val = SectorVec(data.clone());
+                                write_data = data;
+                            },
+                            _ => {}
+                        }
+
+                        let maybe_writing = self.stable_storage.get(&("writing_".to_owned() + &sector.to_string())).await;
+                        match maybe_writing {
+                            Some(data) => {
+                                self.metadata.get_mut(&sector).unwrap().writing = u8_to_bool(data[0]); 
+                                writing = true
+                            },
+                            _ => {}
+                        }   
                     }
-                },
-                _ => {}
-            }
-
-            let maybe_write_val = self.stable_storage.get("write_val").await;
-            let mut write_data = Vec::new();
-            match maybe_write_val {
-                Some(data) => {
-                    self.write_val = SectorVec(data.clone());
-                    write_data = data;
-                },
-                _ => {}
-            }
-
-            let maybe_writing = self.stable_storage.get("writing").await;
-            let mut writing = false;
-            match maybe_writing {
-                Some(data) => {
-                    self.writing = u8_to_bool(data[0]); 
-                    writing = true
-                },
-                _ => {}
-            }
-
-            match self.stable_storage.get("current_cmd_header").await {
-                Some(data) => {
-                    if data.len() == 0 {
-                        return None;
-                    }
-                    let decoded : ClientCommandHeader = bincode::deserialize(&data).unwrap();
-                    if writing {
-                        Some(ClientRegisterCommand {
-                            header : decoded,
-                            content : RedefWrite {
-                                data : SectorVec(write_data),
+                    match self.stable_storage.get("current_cmd_header").await {
+                        Some(data) => {
+                            if data.len() == 0 {
+                                return None;
                             }
-                        })
-                    } else {
-                        Some(ClientRegisterCommand {
-                            header : decoded,
-                            content : RedefRead
-                        })
+                            let decoded : ClientCommandHeader = bincode::deserialize(&data).unwrap();
+                            if writing {
+                                return Some(ClientRegisterCommand {
+                                    header : decoded,
+                                    content : RedefWrite {
+                                        data : SectorVec(write_data),
+                                    }
+                                });
+                            } else {
+                                return Some(ClientRegisterCommand {
+                                    header : decoded,
+                                    content : RedefRead
+                                });
+                            }
+                        }
+                        _ => {return None;}
                     }
                 }
-                _ => {None}
+                _ => {return None;}
             }
-
         }
     }
 
@@ -356,26 +505,36 @@ pub mod atomic_register_public {
         ) {
             let ClientCommandHeader {
                 request_identifier : req_id,
-                sector_idx : sect_idx,
+                sector_idx : sector_id,
             } = cmd.header;
+    
+            if !self.metadata.contains_key(&sector_id) {
+                self.generate_metadata(sector_id).await;
+            }
 
-            self.rid += 1;
-            self.callbacks.insert(self.rid, operation_complete);
-            self.request_ids.insert(self.rid, req_id);
-            self.readlist = HashMap::new();
-            self.acklist = HashSet::new();
+            // self.metadata.get(&sector_id).unwrap().notifier.notified().await;
+
+            self.incr_rid(sector_id);
+
+            let current_rid = self.metadata.get(&sector_id).unwrap().rid;
+            self.callbacks.insert((sector_id, current_rid), operation_complete);
+            self.request_ids.insert((sector_id, current_rid), req_id);
+            
+            self.metadata.get_mut(&sector_id).unwrap().readlist = HashMap::new();
+            self.metadata.get_mut(&sector_id).unwrap().acklist = HashSet::new();
 
             let new_hdr = SystemCommandHeader {
                 process_identifier : self.id,
                 msg_ident : Uuid::new_v4(),
-                read_ident : self.rid,
-                sector_idx : sect_idx,
+                read_ident : current_rid,
+                sector_idx : sector_id,
             };
 
             match cmd.content {
                 ClientRegisterCommandContent::Read => {
-                    self.reading = true;
-                    self.stable_storage.put("rid", &self.rid.to_be_bytes());
+                    self.metadata.get_mut(&sector_id).unwrap().reading = true;
+                    self.stable_storage.put(&("rid_".to_owned() + &sector_id.to_string()), &self.metadata.get(&sector_id).unwrap().rid.to_be_bytes()).await.unwrap();
+
                     self.register_client.broadcast(Broadcast {
                         cmd : Arc::new(SystemRegisterCommand {
                             header : new_hdr,
@@ -384,24 +543,27 @@ pub mod atomic_register_public {
                     }).await
                 },
                 ClientRegisterCommandContent::Write{data} => {
-                    self.write_val = data.clone();
-                    self.writing = true;
+                    self.metadata.get_mut(&sector_id).unwrap().write_val = data.clone();
+                    self.metadata.get_mut(&sector_id).unwrap().writing = true;
                     let cmd_serded = bincode::serialize(&cmd.header).unwrap();
-                    self.stable_storage.put("current_cmd_header", &cmd_serded);
-                    self.stable_storage.put("rid", &self.rid.to_be_bytes());
-                    self.stable_storage.put("write_val", &self.write_val.0);
-                    self.stable_storage.put("writing", &[bool_to_u8(self.writing)]);
+
+
+                    self.stable_storage.put(&("current_cmd_header_"), &cmd_serded).await.unwrap();
+                    self.stable_storage.put(&("rid_".to_owned() + &sector_id.to_string()), &self.metadata.get(&sector_id).unwrap().rid.to_be_bytes()).await.unwrap();
+                    self.stable_storage.put(&("write_val_".to_owned() + &sector_id.to_string()), &data.clone().0).await.unwrap();
+                    self.stable_storage.put(&("writing_".to_owned() + &sector_id.to_string()), &[bool_to_u8(true)]).await.unwrap();
 
                     self.register_client.broadcast(Broadcast {
                         cmd : Arc::new(SystemRegisterCommand {
                             header : new_hdr,
-                            content : SystemRegisterCommandContent::WriteProc {
-                                timestamp : self.sector_manager.read_metadata(sect_idx).await.0, 
-                                write_rank : self.sector_manager.read_metadata(sect_idx).await.1, 
-                                data_to_write : data,
-                            }
+                            content : SystemRegisterCommandContent::ReadProc,
+                            // WriteProc {
+                            //     timestamp : self.metadata.get(&sector_id).unwrap().ts, 
+                            //     write_rank : self.metadata.get(&sector_id).unwrap().wr, 
+                            //     data_to_write : data,
+                            // }
                         })
-                    }).await
+                    }).await;
                 },
             }
         }
@@ -414,9 +576,12 @@ pub mod atomic_register_public {
                 sector_idx : sector_id,
             } = cmd.header;
 
+            if !self.metadata.contains_key(&sector_id) {
+                self.generate_metadata(sector_id).await;
+            }
             match cmd.content {
                 SystemRegisterCommandContent::ReadProc => {
-                    self.register_client.send(SendStruct{
+                    self.register_client.send(SendStruct {
                         cmd : Arc :: new(SystemRegisterCommand {
                             header : SystemCommandHeader {
                                 process_identifier : self.id,
@@ -425,12 +590,9 @@ pub mod atomic_register_public {
                                 sector_idx : sector_id,
                             },
                             content : SystemRegisterCommandContent::Value {
-                                timestamp : self.sector_manager.read_metadata(sector_id).await.0, 
-                                // self.ts,
-                                write_rank : self.sector_manager.read_metadata(sector_id).await.1, 
-                                // self.wr,
-                                sector_data : self.sector_manager.read_data(sector_id).await, 
-                                // self.val.clone(),
+                                timestamp : self.metadata.get(&sector_id).unwrap().ts, 
+                                write_rank : self.metadata.get(&sector_id).unwrap().wr, 
+                                sector_data : self.metadata.get(&sector_id).unwrap().val.clone(), 
                             },
                         }),
                         target : proc_id as usize,
@@ -438,19 +600,20 @@ pub mod atomic_register_public {
                 },
 
                 SystemRegisterCommandContent::Value{timestamp, write_rank, sector_data} => {
-                    if rid_of_cmd == self.rid {
-                        self.readlist.insert(proc_id, (timestamp, write_rank, sector_data));
-                        if self.readlist.len() > self.proc_count / 2 && (self.reading || self.writing) {
-                            let (maxts, rr, readval) = highest(&self.readlist); 
-                            self.readlist = HashMap::new();
-                            self.acklist = HashSet::new();
+                    if rid_of_cmd == self.metadata.get(&sector_id).unwrap().rid {
+                        self.metadata.get_mut(&sector_id).unwrap().readlist.insert(proc_id, (timestamp, write_rank, sector_data));
+                        if self.metadata.get(&sector_id).unwrap().readlist.len() > self.proc_count / 2 && (self.metadata.get(&sector_id).unwrap().reading || self.metadata.get(&sector_id).unwrap().writing) {
+                            let (maxts, rr, readval) = highest(&self.metadata.get(&sector_id).unwrap().readlist); 
+                            self.metadata.get_mut(&sector_id).unwrap().read_val = readval.clone();
+                            self.metadata.get_mut(&sector_id).unwrap().readlist = HashMap::new();
+                            self.metadata.get_mut(&sector_id).unwrap().acklist = HashSet::new();
                             let hdr = SystemCommandHeader {
                                 process_identifier : self.id,
                                 msg_ident : msg_uuid, // ???
                                 read_ident : rid_of_cmd, //  == self.rid
                                 sector_idx : sector_id,
                             };
-                            if self.reading {
+                            if self.metadata.get(&sector_id).unwrap().reading {
                                 self.register_client.broadcast(Broadcast {
                                     cmd : Arc::new(SystemRegisterCommand {
                                         header : hdr,
@@ -467,10 +630,10 @@ pub mod atomic_register_public {
                                     cmd : Arc::new(SystemRegisterCommand {
                                         header : hdr,
                                         content : SystemRegisterCommandContent::WriteProc {
-                                            data_to_write : self.write_val.clone(), 
+                                            data_to_write : self.metadata.get(&sector_id).unwrap().write_val.clone(), 
                                             timestamp : maxts + 1,
                                             write_rank : self.id,
-                                        } // == highest(self.readlist)
+                                        }
                                     })
                                 }).await;
                             }
@@ -479,16 +642,18 @@ pub mod atomic_register_public {
                 },
 
                 SystemRegisterCommandContent::WriteProc{timestamp, write_rank, data_to_write} => {
-                    let (my_ts, my_wr) = self.sector_manager.read_metadata(sector_id).await;
-                    // let (my_ts, my_wr) = (self.ts, self.wr);
+                    // let (my_ts, my_wr) = self.sector_manager.read_metadata(sector_id).await;
+                    let my_ts = self.metadata.get(&sector_id).unwrap().ts;
+                    let my_wr = self.metadata.get(&sector_id).unwrap().wr;
 
                     if timestamp > my_ts || (timestamp == my_ts && write_rank > my_wr) {
-                        // self.ts = timestamp;
-                        // self.wr = write_rank;
-                        self.sector_manager.write(sector_id, &(data_to_write, timestamp, write_rank));
-                        // self.val = data_to_write.clone();
+                        self.metadata.get_mut(&sector_id).unwrap().ts = timestamp;
+                        self.metadata.get_mut(&sector_id).unwrap().wr = write_rank;
+                        self.metadata.get_mut(&sector_id).unwrap().val = data_to_write.clone();
+
+                        self.sector_manager.write(sector_id, &(data_to_write, timestamp, write_rank)).await;
                     }
-                    self.register_client.send(SendStruct{
+                    self.register_client.send(SendStruct {
                         cmd : Arc :: new(SystemRegisterCommand {
                             header : SystemCommandHeader {
                                 process_identifier : self.id,
@@ -502,34 +667,37 @@ pub mod atomic_register_public {
                     }).await;
                 },
                 SystemRegisterCommandContent::Ack => {
-                    if rid_of_cmd == self.rid {
-                        self.acklist.insert(proc_id);
-                        if self.acklist.len() > self.proc_count / 2 && (self.reading || self.writing) {
-                            self.acklist.clear();
-                            let func_to_call = self.callbacks.remove_entry(&rid_of_cmd).unwrap().1; 
-                            if(self.reading) {
-                                self.reading = false;
-                                self.stable_storage.put("current_cmd_header", &Vec::new());
+                    if rid_of_cmd == self.metadata.get(&sector_id).unwrap().rid {
+                        self.metadata.get_mut(&sector_id).unwrap().acklist.insert(proc_id);
+                        if self.metadata.get(&sector_id).unwrap().acklist.len() > self.proc_count / 2 
+                        && (self.metadata.get(&sector_id).unwrap().reading || self.metadata.get(&sector_id).unwrap().writing) {
+                            self.metadata.get_mut(&sector_id).unwrap().acklist.clear();
+                            let func_to_call = self.callbacks.remove_entry(&(sector_id, rid_of_cmd)).unwrap().1; 
+                            if self.metadata.get(&sector_id).unwrap().reading {
+                                self.metadata.get_mut(&sector_id).unwrap().reading = false;
+                                self.stable_storage.put("current_cmd_header", &Vec::new()).await.unwrap();
                                 let operation = OperationComplete {
                                     status_code : StatusCode::Ok,
-                                    request_identifier : self.request_ids[&self.rid],
+                                    request_identifier : *self.request_ids.get(&(sector_id, self.metadata.get(&sector_id).unwrap().rid)).unwrap(),
                                     op_return : OperationReturn::Read(ReadReturn {
-                                        read_data : Some(self.read_val.clone()),
+                                        read_data : Some(self.metadata.get(&sector_id).unwrap().read_val.clone()),
                                     }),
                                 };
                                 func_to_call(operation.clone());
                             }
                             else {
-                                self.writing = false;
-                                self.stable_storage.put("current_cmd_header", &Vec::new());
-                                self.stable_storage.put("writing", &[bool_to_u8(self.writing)]);
+                                self.metadata.get_mut(&sector_id).unwrap().writing = false;
+                                self.stable_storage.put("current_cmd_header", &Vec::new()).await.unwrap();
+                                self.stable_storage.put(&("writing_".to_owned() + &sector_id.to_string()), &[bool_to_u8(false)]).await.unwrap();
+
                                 let operation = OperationComplete {
                                     status_code : StatusCode::Ok,
-                                    request_identifier : self.request_ids[&self.rid],
+                                    request_identifier : *self.request_ids.get(&(sector_id, self.metadata.get(&sector_id).unwrap().rid)).unwrap(),
                                     op_return : OperationReturn::Write,
                                 };
                                 func_to_call(operation.clone());
                             }
+                            // self.metadata.get(&sector_id).unwrap().notifier.notify_one();
                         }
                     }
                 },
@@ -542,21 +710,22 @@ pub mod atomic_register_public {
     /// Storage for atomic register algorithm data is separated into StableStorage.
     /// Communication with other processes of the system is to be done by register_client.
     /// And sectors must be stored in the sectors_manager instance.
-    pub async fn build_atomic_register(
+    pub async fn build_my_atomic_register(
         self_ident: u8,
         metadata: Box<dyn StableStorage>,
         register_client: Arc<dyn RegisterClient>,
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: usize,
-    ) -> (Box<dyn AtomicRegister>, Option<ClientRegisterCommand>) {
+    ) -> (Box<MyAtomicRegister>, Option<ClientRegisterCommand>) {
         let mut register = Box::new(MyAtomicRegister {
-            rid : 0 as u64,
-            readlist : HashMap::new(),
-            acklist : HashSet::new(),
-            reading : false,
-            writing : false,
-            write_val : empty_ans(),  
-            read_val : empty_ans(),
+            // rid : self_ident as u64,
+            // readlist : HashMap::new(),
+            // acklist : HashSet::new(),
+            // reading : false,
+            // writing : false,
+            // write_val : empty_ans(),  
+            // read_val : empty_ans(),
+            metadata :  HashMap::new(),
             proc_count : processes_count,
             register_client : register_client,
             id : self_ident,
@@ -568,6 +737,16 @@ pub mod atomic_register_public {
         let possible_operation = register.restore_and_get().await;
         (register, possible_operation)
     }
+
+    pub async fn build_atomic_register(self_ident: u8,
+        metadata: Box<dyn StableStorage>,
+        register_client: Arc<dyn RegisterClient>,
+        sectors_manager: Arc<dyn SectorsManager>,
+        processes_count: usize,
+    ) -> (Box<dyn AtomicRegister>, Option<ClientRegisterCommand>) {
+        let (register, possible_operation) = build_my_atomic_register(self_ident, metadata, register_client, sectors_manager, processes_count).await;
+        (register, possible_operation)
+    }
 }
 
 pub mod sectors_manager_public {
@@ -575,6 +754,7 @@ pub mod sectors_manager_public {
     use crate::{SectorIdx, SectorVec, empty_ans};
     use std::path::PathBuf;
     use tokio::fs::*;
+    use tokio::sync::Semaphore;
 
     #[async_trait::async_trait]
     pub trait SectorsManager: Send + Sync {
@@ -592,6 +772,7 @@ pub mod sectors_manager_public {
 
     pub struct MyManager {
         root_path : PathBuf,
+        uniqueness_control : Semaphore,
     }
 
     #[async_trait::async_trait]
@@ -634,16 +815,29 @@ pub mod sectors_manager_public {
             path.push(idx.to_string());
             let SectorVec(actual_data) = data;
 
-            write(path.clone(), actual_data).await.unwrap();
+            let mut path_to_tmp = self.root_path.clone();
 
-            path.pop();
-            path.push("metadata");
-            if !path.exists() {
-                create_dir_all(path.clone()).await.unwrap();
+            create_dir_all(path_to_tmp.clone()).await.unwrap();
+            path_to_tmp.push(idx.to_string() + "_tmp");
+            {
+                let _permit = self.uniqueness_control.acquire();    
+                write(path_to_tmp.clone(), actual_data).await.unwrap();
+                rename(path_to_tmp.clone(), path.clone()).await.unwrap();
+
+                path.pop();
+                path.push("metadata");
+                if !path.exists() {
+                    create_dir_all(path.clone()).await.unwrap();
+                }
+                path.push(idx.to_string() + "_meta");
+
+                path_to_tmp.pop();
+                path_to_tmp.push("metadata");
+                path_to_tmp.push(idx.to_string() + "_meta" + "_tmp");
+
+                write(path_to_tmp.clone(), bincode::serialize(&(ts, rank)).unwrap()).await.unwrap();
+                rename(path_to_tmp, path).await.unwrap();
             }
-            path.push(idx.to_string() + "_meta");
-
-            write(path, bincode::serialize(&(ts, rank)).unwrap()).await.unwrap();
         }
     }
 
@@ -651,6 +845,7 @@ pub mod sectors_manager_public {
     pub fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
         Arc::new(MyManager {
             root_path : path,
+            uniqueness_control : Semaphore::new(1),
         })
     }
 }
@@ -670,7 +865,6 @@ pub mod transfer_public {
         let msg_type = prologue[3 + 4];
         let proc_id = prologue[2 + 4];
 
-        println!("Deserialized {:?}", msg_type);
         // FIRST 4 BYTES SHOULD CONTAIN MAGIC_NUMBER
         match msg_type { // MSG TYPE
             1 => { // READ
@@ -876,8 +1070,12 @@ pub mod register_client_public {
     use std::sync::Arc;
     use tokio::net::TcpStream;
     use tokio::io::{AsyncWriteExt};
+    use tokio::sync::{Mutex};
 
     use hmac::{Mac, NewMac};
+    use uuid::Uuid;
+    use std::collections::HashMap;
+
 
     #[async_trait::async_trait]
     /// We do not need any public implementation of this trait. It is there for use
@@ -892,11 +1090,26 @@ pub mod register_client_public {
     }
 
     pub struct MyRegisterClient {
-        pub hmac_system_key: [u8; 64],
-        pub hmac_client_key: [u8; 32],
+        hmac_system_key: [u8; 64],
+        // hmac_client_key: [u8; 32],
 
         /// Host and port, indexed by identifiers, of every other process.
-        pub tcp_locations: Vec<(String, u16)>,
+        tcp_locations: Vec<(String, u16)>,
+        
+        pub unanswered_messages : Arc<Mutex<HashMap<Uuid, Send>>>,
+    }
+    impl MyRegisterClient {
+        pub async fn send_raw_bytes_no_ack(&self, msg : Vec<u8>, target : usize) {
+            let parts = &self.tcp_locations[target - 1];
+            let address = parts.0.clone() + ":" + &parts.1.to_string(); 
+            let mut tcp_stream = TcpStream::connect(&address).await.unwrap();
+            let mut mac = HmacSha256::new_varkey(&self.hmac_system_key).unwrap();
+            mac.update(&msg);
+            let hmac_tag = mac.finalize().into_bytes();
+            let mut msg_clone = msg.clone();
+            msg_clone.extend(hmac_tag); // HMAC TAG
+            tcp_stream.write_all(&msg_clone).await.unwrap();
+        }
     }
 
     #[async_trait::async_trait]
@@ -917,22 +1130,29 @@ pub mod register_client_public {
             cmd_serialized.extend(hmac_tag); // HMAC TAG
 
             tcp_stream.write_all(&cmd_serialized).await.unwrap();
+            self.unanswered_messages.lock().await.insert(msg.cmd.header.msg_ident, msg);
         }
 
         async fn broadcast(&self, msg: Broadcast) {
+            let mut tasks = Vec::new();
             for i in 0..(self.tcp_locations.len()) {
-                self.send(Send {
+                tasks.push(self.send(Send {
                     cmd : msg.cmd.clone(),
                     target : (i + 1)
-                }).await;
+                }));
+            }
+            while !tasks.is_empty() {
+                let task = tasks.pop().unwrap();
+                task.await;
             }
         }
     }
     pub fn build_register_client(hmac_system_key : [u8; 64], hmac_client_key : [u8; 32], tcp_locations : Vec<(String, u16)>) -> Arc<MyRegisterClient> {
         Arc::new(MyRegisterClient {
-            hmac_client_key,
+            // hmac_client_key,
             hmac_system_key,
             tcp_locations,
+            unanswered_messages : Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -940,6 +1160,7 @@ pub mod register_client_public {
         pub cmd: Arc<SystemRegisterCommand>,
     }
 
+    #[derive(Clone)]
     pub struct Send {
         pub cmd: Arc<SystemRegisterCommand>,
         /// Identifier of the target process. Those start at 1.
