@@ -1,6 +1,7 @@
 use assignment_2_solution::{build_sectors_manager, SectorVec};
 use ntest::timeout;
 use tempfile::tempdir;
+use std::path::Path;
 
 #[tokio::test]
 #[timeout(200)]
@@ -8,6 +9,9 @@ async fn drive_can_store_data() {
     // given
     let root_drive_dir = tempdir().unwrap();
     let sectors_manager = build_sectors_manager(root_drive_dir.into_path());
+
+    // let root_drive_dir = Path::new("/home/janek/Desktop/SR/dsassignment02/public-tests");
+    // let sectors_manager = build_sectors_manager(root_drive_dir.to_path_buf());
 
     // when
     sectors_manager

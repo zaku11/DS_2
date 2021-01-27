@@ -52,6 +52,7 @@ async fn single_process_system_completes_operations() {
 
     // when
     send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
+    println!("0");
 
     // then
     const EXPECTED_RESPONSES_SIZE: usize = 48;
@@ -61,7 +62,9 @@ async fn single_process_system_completes_operations() {
         .await
         .expect("Less data then expected");
 
+    println!("1");
     // asserts for write response
+
     assert_eq!(&buf[0..4], MAGIC_NUMBER.as_ref());
     assert_eq!(buf[7], 0x42);
     assert_eq!(
@@ -69,6 +72,8 @@ async fn single_process_system_completes_operations() {
         request_identifier
     );
     assert!(hmac_tag_is_ok(&hmac_client_key, &buf));
+    println!("HERE");
+    // tokio::time::sleep(Duration::from_millis(4000)).await;
 }
 
 type HmacSha256 = Hmac<Sha256>;

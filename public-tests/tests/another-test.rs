@@ -47,7 +47,7 @@ async fn one_reads_other_writes() {
     tokio::spawn(run_register_process(config));
     tokio::spawn(run_register_process(config2));
   //  tokio::spawn(run_register_process(config2));
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let mut stream = TcpStream::connect(("127.0.0.1", tcp_port))
         .await
         .expect("Could not connect to TCP port");
@@ -76,7 +76,6 @@ async fn one_reads_other_writes() {
         .await
         .expect("Less data then expected");
     send_cmd(&read_cmd, &mut stream2, &hmac_client_key.clone()).await;
-    println!("received buffer: {:?}", buf);
 
 
     let mut buf2 : Vec<u8> = vec![0; 4096+EXPECTED_RESPONSES_SIZE];
@@ -103,7 +102,7 @@ async fn one_reads_other_writes() {
 
 
 #[tokio::test]
-#[timeout(25000)]
+#[timeout(250000)]
 async fn multiple_reads_and_writes(){
     const EXPECTED_RESPONSES_SIZE: usize = 48;
     let hmac_client_key = [5; 32];
@@ -152,12 +151,11 @@ async fn multiple_reads_and_writes(){
 
             },
             content: ClientRegisterCommandContent::Write {
-                data: SectorVec(vec![3; 4096]),
+                data: SectorVec(vec![i as u8; 4096]),
             },
         });
         send_cmd(&write_cmd, &mut stream, &hmac_client_key.clone()).await;
     }
-
     for i in 0..10 {
         let mut buf = [0_u8; EXPECTED_RESPONSES_SIZE];
         stream
@@ -165,7 +163,6 @@ async fn multiple_reads_and_writes(){
             .await
             .expect("Less data then expected");
         //writes should happen in correct order , since they concern single sector
-        println!("received buffer: {:?}", buf);
         assert_eq!(&buf[0..4], MAGIC_NUMBER.as_ref());
         assert_eq!(buf[7], 0x42);
         assert_eq!(
@@ -173,7 +170,6 @@ async fn multiple_reads_and_writes(){
             request_identifier + i
         );
         assert!(hmac_tag_is_ok(&hmac_client_key, &buf));
-        println!("ITERATION {:?} IS CORRENT! WELL DONE", i);
     }
     // when
     for i in 0..10 {
@@ -198,7 +194,7 @@ async fn multiple_reads_and_writes(){
             u64::from_be_bytes(buf2[8..16].try_into().unwrap()),
             (request_identifier+100 +i)
         );
-        assert_eq!(&buf2[16..4112], vec![3_u8; 4096].as_slice());
+        assert_eq!(&buf2[16..4112], vec![9_u8; 4096].as_slice());
         assert!(hmac_tag_is_ok(&hmac_client_key, &buf2));
     }
 

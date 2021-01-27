@@ -20,9 +20,6 @@ use crate::{RegisterCommand::Client, RegisterCommand::System};
 use std::sync::{Arc};
 use uuid::Uuid;
 use tokio::time::{Duration, interval};
-use std::collections::HashMap;
-use std::sync::Condvar;
-use tokio::sync::Notify;
 
 
 fn does_end_with_magic(v : &Vec<u8>) -> bool {
@@ -44,7 +41,7 @@ fn client_response_to_u8(operation : OperationComplete, code_shift : u8, public_
         buffer.push(0 as u8); // PADDING
     }
     buffer.push(operation.status_code as u8); // STATUS CODE
-    buffer.push(operation.status_code as u8 + code_shift + 0x40); // MSG TYPE
+    buffer.push(code_shift + 0x40); // MSG TYPE
     buffer.extend(operation.request_identifier.to_be_bytes().iter()); // REQUEST NUMBER
     if operation.status_code == StatusCode::Ok {
         match operation.op_return {
@@ -89,7 +86,7 @@ pub async fn run_register_process(config: Configuration) {
 
     let mut workers = Arc::new(Vec::new());
 
-    let register_client = build_register_client(config.hmac_system_key, config.hmac_client_key, config.public.tcp_locations.clone());
+    let register_client = build_register_client(config.hmac_system_key, config.public.tcp_locations.clone());
 
     for i in 0..WORKER_COUNT {
         let mut path_to_another_register = config.public.storage_dir.clone();
@@ -105,7 +102,6 @@ pub async fn run_register_process(config: Configuration) {
     let max_sector = config.public.max_sector;
     let reg_clone = register_client.clone();
 
-    let rank = config.public.self_rank.clone();
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_millis(500));
         loop {
@@ -115,13 +111,11 @@ pub async fn run_register_process(config: Configuration) {
             let mut messages = Vec::new();
             {
                 let inside = &*reg_clone.unanswered_messages.lock().await;
-                println!("Got {:?} messages in {:?}", inside.len(), rank);
                 for (key, message) in &*inside {
                     messages.push((key.clone(), message.clone()));
                 }
             }
             for (_, message) in &*messages {
-                println!("Retransmission...");
                 reg_clone.send(message.clone()).await;
             }
         }
@@ -236,7 +230,7 @@ pub async fn run_register_process(config: Configuration) {
                             msg_type, public_key)).await.unwrap();
                             return;
                         }
-                        if client_cmd.header.sector_idx >= max_sector || client_cmd.header.sector_idx < 0 {
+                        if client_cmd.header.sector_idx >= max_sector {
                             copied_socket.write_all(&client_response_to_u8(OperationComplete {
                                 status_code : StatusCode::InvalidSectorIndex,
                                 request_identifier : req_id,
@@ -249,11 +243,10 @@ pub async fn run_register_process(config: Configuration) {
                             return;
                         } 
                         let sector_id = client_cmd.header.sector_idx;
-                        let index = WORKER_COUNT as usize * (sector_id as usize /  max_sector as usize);
+                        let index = WORKER_COUNT as usize * sector_id as usize /  max_sector as usize;
                         let which_register = workers_clone.get(index).unwrap(); // TODO Work out a better strategy
-                        // let which_register = workers_clone.get(0).unwrap();
 
-                        let mut notifier;
+                        let notifier;
                         {
                             let mut lock = which_register.lock().await;
                             if !lock.metadata.contains_key(&sector_id) {
@@ -276,10 +269,10 @@ pub async fn run_register_process(config: Configuration) {
 
                     },
                     Ok(System(system_cmd)) => {
-                        let index = WORKER_COUNT as usize * (system_cmd.header.sector_idx as usize /  max_sector as usize);
+                        let index = WORKER_COUNT as usize * system_cmd.header.sector_idx as usize /  max_sector as usize;
                         let target = system_cmd.header.process_identifier.clone() as usize;
                         let which_register = workers_clone.get(index).unwrap(); // TODO Work out a better strategy
-                        // let which_register = workers_clone.get(0).unwrap();
+
                         let uuid = system_cmd.header.msg_ident.clone();
                         {                        
                             let mut lock = which_register.lock().await;
@@ -310,7 +303,7 @@ pub mod atomic_register_public {
     use std::sync::Arc;
     use uuid::Uuid;
     use std::collections::{HashMap, HashSet};
-    use tokio::sync::{Mutex, Notify};
+    use tokio::sync::{Notify};
 
     #[async_trait::async_trait]
     pub trait AtomicRegister: core::marker::Send + core::marker::Sync {
@@ -356,14 +349,15 @@ pub mod atomic_register_public {
     // #[async_trait::async_trait]
     impl MyAtomicRegister {
         fn incr_rid(&mut self, idx : u64) {
-            // self.metadata.get_mut(&idx).unwrap().rid += WORKER_COUNT as u64;
             self.metadata.get_mut(&idx).unwrap().rid += 1 as u64;
         }
         pub async fn generate_metadata(&mut self, idx : u64) {
+            let (ts, wr) =  self.sector_manager.read_metadata(idx).await;
+            let val = self.sector_manager.read_data(idx).await;
             self.metadata.insert(idx, AtomicRegisterMetadata {
-                ts : 0 as u64,
-                wr : 0 as u8,
-                val : empty_ans(),
+                ts,
+                wr,
+                val,
 
                 rid : 0,
                 readlist : HashMap::new(),
@@ -512,16 +506,16 @@ pub mod atomic_register_public {
                 self.generate_metadata(sector_id).await;
             }
 
-            // self.metadata.get(&sector_id).unwrap().notifier.notified().await;
-
             self.incr_rid(sector_id);
 
             let current_rid = self.metadata.get(&sector_id).unwrap().rid;
             self.callbacks.insert((sector_id, current_rid), operation_complete);
             self.request_ids.insert((sector_id, current_rid), req_id);
             
-            self.metadata.get_mut(&sector_id).unwrap().readlist = HashMap::new();
-            self.metadata.get_mut(&sector_id).unwrap().acklist = HashSet::new();
+            let this_sector = self.metadata.get_mut(&sector_id).unwrap();
+
+            this_sector.readlist = HashMap::new();
+            this_sector.acklist = HashSet::new();
 
             let new_hdr = SystemCommandHeader {
                 process_identifier : self.id,
@@ -532,7 +526,7 @@ pub mod atomic_register_public {
 
             match cmd.content {
                 ClientRegisterCommandContent::Read => {
-                    self.metadata.get_mut(&sector_id).unwrap().reading = true;
+                    this_sector.reading = true;
                     self.stable_storage.put(&("rid_".to_owned() + &sector_id.to_string()), &self.metadata.get(&sector_id).unwrap().rid.to_be_bytes()).await.unwrap();
 
                     self.register_client.broadcast(Broadcast {
@@ -543,13 +537,13 @@ pub mod atomic_register_public {
                     }).await
                 },
                 ClientRegisterCommandContent::Write{data} => {
-                    self.metadata.get_mut(&sector_id).unwrap().write_val = data.clone();
-                    self.metadata.get_mut(&sector_id).unwrap().writing = true;
+                    this_sector.write_val = data.clone();
+                    this_sector.writing = true;
                     let cmd_serded = bincode::serialize(&cmd.header).unwrap();
 
 
                     self.stable_storage.put(&("current_cmd_header_"), &cmd_serded).await.unwrap();
-                    self.stable_storage.put(&("rid_".to_owned() + &sector_id.to_string()), &self.metadata.get(&sector_id).unwrap().rid.to_be_bytes()).await.unwrap();
+                    self.stable_storage.put(&("rid_".to_owned() + &sector_id.to_string()), &this_sector.rid.to_be_bytes()).await.unwrap();
                     self.stable_storage.put(&("write_val_".to_owned() + &sector_id.to_string()), &data.clone().0).await.unwrap();
                     self.stable_storage.put(&("writing_".to_owned() + &sector_id.to_string()), &[bool_to_u8(true)]).await.unwrap();
 
@@ -557,11 +551,6 @@ pub mod atomic_register_public {
                         cmd : Arc::new(SystemRegisterCommand {
                             header : new_hdr,
                             content : SystemRegisterCommandContent::ReadProc,
-                            // WriteProc {
-                            //     timestamp : self.metadata.get(&sector_id).unwrap().ts, 
-                            //     write_rank : self.metadata.get(&sector_id).unwrap().wr, 
-                            //     data_to_write : data,
-                            // }
                         })
                     }).await;
                 },
@@ -579,6 +568,8 @@ pub mod atomic_register_public {
             if !self.metadata.contains_key(&sector_id) {
                 self.generate_metadata(sector_id).await;
             }
+            let this_sector = self.metadata.get_mut(&sector_id).unwrap();
+
             match cmd.content {
                 SystemRegisterCommandContent::ReadProc => {
                     self.register_client.send(SendStruct {
@@ -590,9 +581,9 @@ pub mod atomic_register_public {
                                 sector_idx : sector_id,
                             },
                             content : SystemRegisterCommandContent::Value {
-                                timestamp : self.metadata.get(&sector_id).unwrap().ts, 
-                                write_rank : self.metadata.get(&sector_id).unwrap().wr, 
-                                sector_data : self.metadata.get(&sector_id).unwrap().val.clone(), 
+                                timestamp : this_sector.ts, 
+                                write_rank : this_sector.wr, 
+                                sector_data : this_sector.val.clone(), 
                             },
                         }),
                         target : proc_id as usize,
@@ -600,20 +591,20 @@ pub mod atomic_register_public {
                 },
 
                 SystemRegisterCommandContent::Value{timestamp, write_rank, sector_data} => {
-                    if rid_of_cmd == self.metadata.get(&sector_id).unwrap().rid {
-                        self.metadata.get_mut(&sector_id).unwrap().readlist.insert(proc_id, (timestamp, write_rank, sector_data));
-                        if self.metadata.get(&sector_id).unwrap().readlist.len() > self.proc_count / 2 && (self.metadata.get(&sector_id).unwrap().reading || self.metadata.get(&sector_id).unwrap().writing) {
-                            let (maxts, rr, readval) = highest(&self.metadata.get(&sector_id).unwrap().readlist); 
-                            self.metadata.get_mut(&sector_id).unwrap().read_val = readval.clone();
-                            self.metadata.get_mut(&sector_id).unwrap().readlist = HashMap::new();
-                            self.metadata.get_mut(&sector_id).unwrap().acklist = HashSet::new();
+                    if rid_of_cmd == this_sector.rid {
+                        this_sector.readlist.insert(proc_id, (timestamp, write_rank, sector_data));
+                        if this_sector.readlist.len() > self.proc_count / 2 && (this_sector.reading || this_sector.writing) {
+                            let (maxts, rr, readval) = highest(&this_sector.readlist); 
+                            this_sector.read_val = readval.clone();
+                            this_sector.readlist = HashMap::new();
+                            this_sector.acklist = HashSet::new();
                             let hdr = SystemCommandHeader {
                                 process_identifier : self.id,
                                 msg_ident : msg_uuid, // ???
                                 read_ident : rid_of_cmd, //  == self.rid
                                 sector_idx : sector_id,
                             };
-                            if self.metadata.get(&sector_id).unwrap().reading {
+                            if this_sector.reading {
                                 self.register_client.broadcast(Broadcast {
                                     cmd : Arc::new(SystemRegisterCommand {
                                         header : hdr,
@@ -630,7 +621,7 @@ pub mod atomic_register_public {
                                     cmd : Arc::new(SystemRegisterCommand {
                                         header : hdr,
                                         content : SystemRegisterCommandContent::WriteProc {
-                                            data_to_write : self.metadata.get(&sector_id).unwrap().write_val.clone(), 
+                                            data_to_write : this_sector.write_val.clone(), 
                                             timestamp : maxts + 1,
                                             write_rank : self.id,
                                         }
@@ -643,13 +634,13 @@ pub mod atomic_register_public {
 
                 SystemRegisterCommandContent::WriteProc{timestamp, write_rank, data_to_write} => {
                     // let (my_ts, my_wr) = self.sector_manager.read_metadata(sector_id).await;
-                    let my_ts = self.metadata.get(&sector_id).unwrap().ts;
-                    let my_wr = self.metadata.get(&sector_id).unwrap().wr;
+                    let my_ts = this_sector.ts;
+                    let my_wr = this_sector.wr;
 
                     if timestamp > my_ts || (timestamp == my_ts && write_rank > my_wr) {
-                        self.metadata.get_mut(&sector_id).unwrap().ts = timestamp;
-                        self.metadata.get_mut(&sector_id).unwrap().wr = write_rank;
-                        self.metadata.get_mut(&sector_id).unwrap().val = data_to_write.clone();
+                        this_sector.ts = timestamp;
+                        this_sector.wr = write_rank;
+                        this_sector.val = data_to_write.clone();
 
                         self.sector_manager.write(sector_id, &(data_to_write, timestamp, write_rank)).await;
                     }
@@ -667,32 +658,32 @@ pub mod atomic_register_public {
                     }).await;
                 },
                 SystemRegisterCommandContent::Ack => {
-                    if rid_of_cmd == self.metadata.get(&sector_id).unwrap().rid {
-                        self.metadata.get_mut(&sector_id).unwrap().acklist.insert(proc_id);
-                        if self.metadata.get(&sector_id).unwrap().acklist.len() > self.proc_count / 2 
-                        && (self.metadata.get(&sector_id).unwrap().reading || self.metadata.get(&sector_id).unwrap().writing) {
-                            self.metadata.get_mut(&sector_id).unwrap().acklist.clear();
+                    if rid_of_cmd == this_sector.rid {
+                        this_sector.acklist.insert(proc_id);
+                        if this_sector.acklist.len() > self.proc_count / 2 
+                        && (this_sector.reading || this_sector.writing) {
+                            this_sector.acklist.clear();
                             let func_to_call = self.callbacks.remove_entry(&(sector_id, rid_of_cmd)).unwrap().1; 
-                            if self.metadata.get(&sector_id).unwrap().reading {
-                                self.metadata.get_mut(&sector_id).unwrap().reading = false;
+                            if this_sector.reading {
+                                this_sector.reading = false;
                                 self.stable_storage.put("current_cmd_header", &Vec::new()).await.unwrap();
                                 let operation = OperationComplete {
                                     status_code : StatusCode::Ok,
-                                    request_identifier : *self.request_ids.get(&(sector_id, self.metadata.get(&sector_id).unwrap().rid)).unwrap(),
+                                    request_identifier : *self.request_ids.get(&(sector_id, this_sector.rid)).unwrap(),
                                     op_return : OperationReturn::Read(ReadReturn {
-                                        read_data : Some(self.metadata.get(&sector_id).unwrap().read_val.clone()),
+                                        read_data : Some(this_sector.read_val.clone()),
                                     }),
                                 };
                                 func_to_call(operation.clone());
                             }
                             else {
-                                self.metadata.get_mut(&sector_id).unwrap().writing = false;
+                                this_sector.writing = false;
                                 self.stable_storage.put("current_cmd_header", &Vec::new()).await.unwrap();
                                 self.stable_storage.put(&("writing_".to_owned() + &sector_id.to_string()), &[bool_to_u8(false)]).await.unwrap();
 
                                 let operation = OperationComplete {
                                     status_code : StatusCode::Ok,
-                                    request_identifier : *self.request_ids.get(&(sector_id, self.metadata.get(&sector_id).unwrap().rid)).unwrap(),
+                                    request_identifier : *self.request_ids.get(&(sector_id, this_sector.rid)).unwrap(),
                                     op_return : OperationReturn::Write,
                                 };
                                 func_to_call(operation.clone());
@@ -755,6 +746,8 @@ pub mod sectors_manager_public {
     use std::path::PathBuf;
     use tokio::fs::*;
     use tokio::sync::Semaphore;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
 
     #[async_trait::async_trait]
     pub trait SectorsManager: Send + Sync {
@@ -772,7 +765,7 @@ pub mod sectors_manager_public {
 
     pub struct MyManager {
         root_path : PathBuf,
-        uniqueness_control : Semaphore,
+        uniqueness_control : Arc<Mutex<HashMap<SectorIdx, Arc<Semaphore>>>>,
     }
 
     #[async_trait::async_trait]
@@ -820,7 +813,20 @@ pub mod sectors_manager_public {
             create_dir_all(path_to_tmp.clone()).await.unwrap();
             path_to_tmp.push(idx.to_string() + "_tmp");
             {
-                let _permit = self.uniqueness_control.acquire();    
+                let mut lock = self.uniqueness_control.lock().await;
+                if !lock.contains_key(&idx) {
+                    lock.insert(idx, Arc::new(Semaphore::new(1)));
+                }
+            }
+
+            {
+                let semaph;
+                {
+                    let lock = self.uniqueness_control.lock().await;
+                    semaph = lock.get(&idx).unwrap().clone();    
+                }
+                let _permit = semaph.acquire();
+
                 write(path_to_tmp.clone(), actual_data).await.unwrap();
                 rename(path_to_tmp.clone(), path.clone()).await.unwrap();
 
@@ -845,7 +851,7 @@ pub mod sectors_manager_public {
     pub fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
         Arc::new(MyManager {
             root_path : path,
-            uniqueness_control : Semaphore::new(1),
+            uniqueness_control : Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -1147,7 +1153,7 @@ pub mod register_client_public {
             }
         }
     }
-    pub fn build_register_client(hmac_system_key : [u8; 64], hmac_client_key : [u8; 32], tcp_locations : Vec<(String, u16)>) -> Arc<MyRegisterClient> {
+    pub fn build_register_client(hmac_system_key : [u8; 64], tcp_locations : Vec<(String, u16)>) -> Arc<MyRegisterClient> {
         Arc::new(MyRegisterClient {
             // hmac_client_key,
             hmac_system_key,
@@ -1215,13 +1221,10 @@ pub mod stable_storage_public {
             create_dir_all(path_to_tmp.clone()).await.unwrap();
 
             path_to_tmp.push("file");
-            if path_to_tmp.is_file() {
-                std::fs::remove_file(path_to_tmp.clone()).unwrap();
-            }
             let mut file = File::create(path_to_tmp.clone()).await.unwrap();
-            file.sync_data().await.unwrap();
 
             file.write_all(value).await.unwrap();
+            file.sync_all().await.unwrap();
 
             let mut path_to_normal = self.dir.clone();
             path_to_normal.push(key_to_path(&my_key));
@@ -1230,7 +1233,11 @@ pub mod stable_storage_public {
             
             path_to_normal.push("file");
 
-            rename(path_to_tmp, path_to_normal).await.unwrap();
+            rename(path_to_tmp, path_to_normal.clone()).await.unwrap();
+            path_to_normal.pop();
+
+            let dir = File::open(path_to_normal).await.unwrap();
+            dir.sync_data().await.unwrap();
 
             Ok(())
         }
