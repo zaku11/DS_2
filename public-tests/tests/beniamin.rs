@@ -13,7 +13,7 @@ static HMAC_TAG_SIZE: usize = 32;
 
 
 #[tokio::test]
-#[timeout(2000)]
+#[timeout(3000)]
 async fn one_reads_other_writes() {
     // given
     let hmac_client_key = [5; 32];

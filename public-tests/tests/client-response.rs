@@ -1,8 +1,7 @@
 use assignment_2_solution::{
     run_register_process, serialize_register_command, ClientCommandHeader, ClientRegisterCommand,
     ClientRegisterCommandContent, Configuration, PublicConfiguration, RegisterCommand, SectorVec,
-    MAGIC_NUMBER,
-    StatusCode,
+    MAGIC_NUMBER, StatusCode
 };
 use hmac::{Hmac, Mac, NewMac};
 use ntest::timeout;
@@ -15,20 +14,27 @@ use tokio::net::TcpStream;
 
 static HMAC_TAG_SIZE: usize = 32;
 
+
+
+
 #[tokio::test]
 #[timeout(2000)]
-async fn single_process_system_completes_operations() {
+async fn client_response_errors() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
     // given
     let hmac_client_key = [5; 32];
-    let tcp_port = 30_287;
+    let tcp_port = 10_000;
     let storage_dir = tempdir().unwrap();
     let request_identifier = 1778;
+
+    let MAX_SECTOR = 20;
 
     let config = Configuration {
         public: PublicConfiguration {
             tcp_locations: vec![("127.0.0.1".to_string(), tcp_port)],
             self_rank: 1,
-            max_sector: 20,
+            max_sector: MAX_SECTOR,
             storage_dir: storage_dir.into_path(),
         },
         hmac_system_key: [1; 64],
@@ -37,14 +43,14 @@ async fn single_process_system_completes_operations() {
 
     tokio::spawn(run_register_process(config));
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let mut stream = TcpStream::connect(("127.0.0.1", tcp_port))
         .await
         .expect("Could not connect to TCP port");
-    let write_cmd = RegisterCommand::Client(ClientRegisterCommand {
+    let write_cmd_wrong_sector_idx = RegisterCommand::Client(ClientRegisterCommand {
         header: ClientCommandHeader {
             request_identifier,
-            sector_idx: 19,
+            sector_idx: MAX_SECTOR + 10,
         },
         content: ClientRegisterCommandContent::Write {
             data: SectorVec(vec![3; 4096]),
@@ -52,7 +58,7 @@ async fn single_process_system_completes_operations() {
     });
 
     // when
-    send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
+    send_cmd(&write_cmd_wrong_sector_idx, &mut stream, &hmac_client_key).await;
 
     // then
     const EXPECTED_RESPONSES_SIZE: usize = 48;
@@ -64,8 +70,40 @@ async fn single_process_system_completes_operations() {
 
     // asserts for write response
     assert_eq!(&buf[0..4], MAGIC_NUMBER.as_ref());
-    assert_eq!(buf[6], StatusCode::Ok as u8);
     assert_eq!(buf[7], 0x42);
+    assert_eq!(buf[6], StatusCode::InvalidSectorIndex as u8); // response status - OK
+    assert_eq!(
+        u64::from_be_bytes(buf[8..16].try_into().unwrap()),
+        request_identifier
+    );
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf));
+
+
+
+    let write_cmd_wrong_hmac = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier,
+            sector_idx: MAX_SECTOR-1,
+        },
+        content: ClientRegisterCommandContent::Write {
+            data: SectorVec(vec![3; 4096]),
+        },
+    });
+
+    // when
+    send_cmd(&write_cmd_wrong_hmac, &mut stream, &[0xde, 32]).await;
+
+
+    // then
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("Less data then expected");
+
+    // asserts for write response
+    assert_eq!(&buf[0..4], MAGIC_NUMBER.as_ref());
+    assert_eq!(buf[7], 0x42);
+    assert_eq!(buf[6], StatusCode::AuthFailure as u8); // response status - OK
     assert_eq!(
         u64::from_be_bytes(buf[8..16].try_into().unwrap()),
         request_identifier
@@ -74,11 +112,13 @@ async fn single_process_system_completes_operations() {
 }
 
 #[tokio::test]
-#[timeout(1000)]
-async fn single_process_system_invalid_hmac() {
+#[timeout(2000)]
+async fn client_response_ok() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
     // given
-    let mut hmac_client_key = [5; 32];
-    let tcp_port = 30_288;
+    let hmac_client_key = [5; 32];
+    let tcp_port = 11_000;
     let storage_dir = tempdir().unwrap();
     let request_identifier = 1778;
 
@@ -95,7 +135,7 @@ async fn single_process_system_invalid_hmac() {
 
     tokio::spawn(run_register_process(config));
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let mut stream = TcpStream::connect(("127.0.0.1", tcp_port))
         .await
         .expect("Could not connect to TCP port");
@@ -110,9 +150,7 @@ async fn single_process_system_invalid_hmac() {
     });
 
     // when
-    hmac_client_key[0] += 1;
     send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
-    hmac_client_key[0] -= 1;
 
     // then
     const EXPECTED_RESPONSES_SIZE: usize = 48;
@@ -124,122 +162,8 @@ async fn single_process_system_invalid_hmac() {
 
     // asserts for write response
     assert_eq!(&buf[0..4], MAGIC_NUMBER.as_ref());
-    assert_eq!(buf[6], StatusCode::AuthFailure as u8);
     assert_eq!(buf[7], 0x42);
-    assert_eq!(
-        u64::from_be_bytes(buf[8..16].try_into().unwrap()),
-        request_identifier
-    );
-    assert!(hmac_tag_is_ok(&hmac_client_key, &buf));
-}
-
-#[tokio::test]
-#[timeout(1000)]
-async fn single_process_system_invalid_sector_idx_1() {
-    // given
-    let hmac_client_key = [5; 32];
-    let tcp_port = 30_289;
-    let storage_dir = tempdir().unwrap();
-    let request_identifier = 1778;
-
-    let config = Configuration {
-        public: PublicConfiguration {
-            tcp_locations: vec![("127.0.0.1".to_string(), tcp_port)],
-            self_rank: 1,
-            max_sector: 20,
-            storage_dir: storage_dir.into_path(),
-        },
-        hmac_system_key: [1; 64],
-        hmac_client_key,
-    };
-
-    tokio::spawn(run_register_process(config));
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut stream = TcpStream::connect(("127.0.0.1", tcp_port))
-        .await
-        .expect("Could not connect to TCP port");
-    let write_cmd = RegisterCommand::Client(ClientRegisterCommand {
-        header: ClientCommandHeader {
-            request_identifier,
-            sector_idx: 1000000,
-        },
-        content: ClientRegisterCommandContent::Write {
-            data: SectorVec(vec![3; 4096]),
-        },
-    });
-
-    // when
-    send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
-
-    // then
-    const EXPECTED_RESPONSES_SIZE: usize = 48;
-    let mut buf = [0_u8; EXPECTED_RESPONSES_SIZE];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .expect("Less data then expected");
-
-    // asserts for write response
-    assert_eq!(&buf[0..4], MAGIC_NUMBER.as_ref());
-    assert_eq!(buf[6], StatusCode::InvalidSectorIndex as u8);
-    assert_eq!(buf[7], 0x42);
-    assert_eq!(
-        u64::from_be_bytes(buf[8..16].try_into().unwrap()),
-        request_identifier
-    );
-    assert!(hmac_tag_is_ok(&hmac_client_key, &buf));
-}
-
-#[tokio::test]
-#[timeout(1000)]
-async fn single_process_system_invalid_sector_idx_2() {
-    // given
-    let hmac_client_key = [5; 32];
-    let tcp_port = 30_290;
-    let storage_dir = tempdir().unwrap();
-    let request_identifier = 1778;
-
-    let config = Configuration {
-        public: PublicConfiguration {
-            tcp_locations: vec![("127.0.0.1".to_string(), tcp_port)],
-            self_rank: 1,
-            max_sector: 20,
-            storage_dir: storage_dir.into_path(),
-        },
-        hmac_system_key: [1; 64],
-        hmac_client_key,
-    };
-
-    tokio::spawn(run_register_process(config));
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut stream = TcpStream::connect(("127.0.0.1", tcp_port))
-        .await
-        .expect("Could not connect to TCP port");
-    let write_cmd = RegisterCommand::Client(ClientRegisterCommand {
-        header: ClientCommandHeader {
-            request_identifier,
-            sector_idx: 20,
-        },
-        content: ClientRegisterCommandContent::Read,
-    });
-
-    // when
-    send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
-
-    // then
-    const EXPECTED_RESPONSES_SIZE: usize = 48;
-    let mut buf = [0_u8; EXPECTED_RESPONSES_SIZE];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .expect("Less data then expected");
-
-    // asserts for write response
-    assert_eq!(&buf[0..4], MAGIC_NUMBER.as_ref());
-    assert_eq!(buf[6], StatusCode::InvalidSectorIndex as u8);
-    assert_eq!(buf[7], 0x41);
+    assert_eq!(buf[6], StatusCode::Ok as u8); // response status - OK
     assert_eq!(
         u64::from_be_bytes(buf[8..16].try_into().unwrap()),
         request_identifier
@@ -255,6 +179,7 @@ async fn send_cmd(register_cmd: &RegisterCommand, stream: &mut TcpStream, hmac_c
     let mut key = HmacSha256::new_varkey(hmac_client_key).unwrap();
     key.update(&data);
     data.extend(key.finalize_reset().into_bytes());
+
     stream.write_all(&data).await.unwrap();
 }
 
@@ -264,3 +189,4 @@ fn hmac_tag_is_ok(key: &[u8], data: &[u8]) -> bool {
     mac.update(&data[..boundary]);
     mac.verify(&data[boundary..]).is_ok()
 }
+

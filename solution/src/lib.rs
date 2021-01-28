@@ -60,14 +60,14 @@ fn client_response_to_u8(operation : OperationComplete, code_shift : u8, public_
     return buffer;
 }
 
-fn ack_to_u8(uuid : Uuid) -> Vec<u8> {
+fn ack_to_u8(uuid : Uuid, status_code : StatusCode, rank : u8, msg_type : u8) -> Vec<u8> {
     let mut ans = Vec::new();
     ans.extend(MAGIC_NUMBER.iter()); // MAGIC NUMBER
-    for _ in 0..3 {
-        ans.push(0); // PADDING
-    }
-    ans.push(0x81); // ACK
-    ans.extend(uuid.as_bytes());
+    ans.push(0); // PADDING
+    ans.push(status_code as u8); // STATUS CODE
+    ans.push(rank); // RANK
+    ans.push(msg_type + 0x40); // MSG TYPE
+    ans.extend(uuid.as_bytes()); // UUID
     ans
 }
 
@@ -78,7 +78,6 @@ pub async fn run_register_process(config: Configuration) {
     let parts = &config.public.tcp_locations[config.public.self_rank as usize - 1];
     let address = parts.0.clone() + ":" + &parts.1.to_string(); 
     let listener = TcpListener::bind(address.clone()).await.unwrap();
-
 
     let mut sector_dir = config.public.storage_dir.clone();
     sector_dir.push("sector_manager");
@@ -129,13 +128,14 @@ pub async fn run_register_process(config: Configuration) {
         let sender_clone = register_client.clone();
         let public_key = pkey.clone();
         let system_key = config.hmac_system_key.clone();
+        let rank = config.public.self_rank;
 
         // Process each socket concurrently.
         tokio::spawn(async move {
             let socket_std = socket.into_std().unwrap();
             let socket_cloned = socket_std.try_clone().unwrap();
-
             let mut copied_socket = TcpStream::from_std(socket_cloned).unwrap();
+
             loop {
                 let mut trash : Vec<u8> = Vec::new();
                 while !does_end_with_magic(&trash) {
@@ -154,7 +154,6 @@ pub async fn run_register_process(config: Configuration) {
                 let mut whole_msg : Vec<u8> = Vec::new();
                 whole_msg.extend(MAGIC_NUMBER.iter());
                 whole_msg.extend(rest.iter());
-
                 let msg_type = rest[3];
                 match msg_type { // MSG TYPE
                     1 => { // READ
@@ -187,7 +186,7 @@ pub async fn run_register_process(config: Configuration) {
                         copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
                         whole_msg.extend(rest_of_the_message.iter());
                     }
-                    0x81 => { // MESSAGE WAS DELIVERED;
+                    0x43 | 0x44 | 0x45 | 0x46 => { // SOME FORM OF ACKNOWLEDGEMENT;
                         let mut rest_of_the_message = [0 as u8; 16];
                         copied_socket.read_exact(&mut rest_of_the_message).await.unwrap();        
                         whole_msg.extend(rest_of_the_message.iter());
@@ -199,13 +198,12 @@ pub async fn run_register_process(config: Configuration) {
                         mac.update(&whole_msg);
 
                         if mac.verify(supposed_hmac.as_ref()).is_ok() {
-                            sender_clone.unanswered_messages.lock().await.remove(&Uuid::from_bytes(rest_of_the_message));
+                            sender_clone.unanswered_messages.lock().await.remove(&(rest[2], msg_type - 0x40, Uuid::from_bytes(rest_of_the_message))); // rank, type, uuid
                         }
-                        return;
+                        continue;
                     }
                     _ => { 
-                        return;
-                        // TODO unknown cmd
+                        continue;
                     }
                 }
                 let mut supposed_hmac = [0 as u8; 32];
@@ -228,7 +226,7 @@ pub async fn run_register_process(config: Configuration) {
                                 }) 
                             }, 
                             msg_type, public_key)).await.unwrap();
-                            return;
+                            continue;
                         }
                         if client_cmd.header.sector_idx >= max_sector {
                             copied_socket.write_all(&client_response_to_u8(OperationComplete {
@@ -240,11 +238,11 @@ pub async fn run_register_process(config: Configuration) {
                                 }) 
                             }, 
                             msg_type, public_key)).await.unwrap();
-                            return;
+                            continue;
                         } 
                         let sector_id = client_cmd.header.sector_idx;
-                        let index = WORKER_COUNT as usize * sector_id as usize /  max_sector as usize;
-                        let which_register = workers_clone.get(index).unwrap(); // TODO Work out a better strategy
+                        let index = sector_id as usize % WORKER_COUNT;
+                        let which_register = workers_clone.get(index).unwrap();
 
                         let notifier;
                         {
@@ -269,9 +267,9 @@ pub async fn run_register_process(config: Configuration) {
 
                     },
                     Ok(System(system_cmd)) => {
-                        let index = WORKER_COUNT as usize * system_cmd.header.sector_idx as usize /  max_sector as usize;
+                        let index = system_cmd.header.sector_idx as usize % WORKER_COUNT;
                         let target = system_cmd.header.process_identifier.clone() as usize;
-                        let which_register = workers_clone.get(index).unwrap(); // TODO Work out a better strategy
+                        let which_register = workers_clone.get(index).unwrap(); 
 
                         let uuid = system_cmd.header.msg_ident.clone();
                         {                        
@@ -279,7 +277,7 @@ pub async fn run_register_process(config: Configuration) {
                             lock.system_command(system_cmd).await;
                         }
                         // After that we need to write ackowledgement
-                        sender_clone.send_raw_bytes_no_ack(ack_to_u8(uuid), target).await;
+                        sender_clone.send_raw_bytes_no_ack(ack_to_u8(uuid, StatusCode::Ok, rank, msg_type), target).await;
                     },
                     Err(_) => {},
                 }
@@ -346,13 +344,12 @@ pub mod atomic_register_public {
         pub metadata : HashMap<u64, AtomicRegisterMetadata>,
     }
     
-    // #[async_trait::async_trait]
     impl MyAtomicRegister {
         fn incr_rid(&mut self, idx : u64) {
             self.metadata.get_mut(&idx).unwrap().rid += 1 as u64;
         }
         pub async fn generate_metadata(&mut self, idx : u64) {
-            let (ts, wr) =  self.sector_manager.read_metadata(idx).await;
+            let (ts, wr) = self.sector_manager.read_metadata(idx).await;
             let val = self.sector_manager.read_data(idx).await;
             self.metadata.insert(idx, AtomicRegisterMetadata {
                 ts,
@@ -828,9 +825,13 @@ pub mod sectors_manager_public {
                 let _permit = semaph.acquire();
 
                 write(path_to_tmp.clone(), actual_data).await.unwrap();
+                (File::open(path_to_tmp.clone())).await.unwrap().sync_all().await.unwrap();
                 rename(path_to_tmp.clone(), path.clone()).await.unwrap();
-
                 path.pop();
+
+                let dir = File::open(path.clone()).await.unwrap();
+                dir.sync_data().await.unwrap();
+
                 path.push("metadata");
                 if !path.exists() {
                     create_dir_all(path.clone()).await.unwrap();
@@ -1097,24 +1098,35 @@ pub mod register_client_public {
 
     pub struct MyRegisterClient {
         hmac_system_key: [u8; 64],
-        // hmac_client_key: [u8; 32],
-
         /// Host and port, indexed by identifiers, of every other process.
         tcp_locations: Vec<(String, u16)>,
-        
-        pub unanswered_messages : Arc<Mutex<HashMap<Uuid, Send>>>,
+        pub unanswered_messages : Arc<Mutex<HashMap<(u8, u8, Uuid), Send>>>,
+        tcp_streams : Arc<Mutex<HashMap <String, Arc<Mutex<TcpStream>>>>>,
     }
     impl MyRegisterClient {
-        pub async fn send_raw_bytes_no_ack(&self, msg : Vec<u8>, target : usize) {
+        pub async fn send_raw_bytes_no_ack(&self, mut msg : Vec<u8>, target : usize) {
             let parts = &self.tcp_locations[target - 1];
             let address = parts.0.clone() + ":" + &parts.1.to_string(); 
-            let mut tcp_stream = TcpStream::connect(&address).await.unwrap();
+            {            
+                let mut lock = self.tcp_streams.lock().await;
+                if !(*lock).contains_key(&address) {
+                    let tcp_stream = TcpStream::connect(&address).await.unwrap();
+                    (*lock).insert(address.clone(), Arc::new(Mutex::new(tcp_stream)));
+                }
+            }
             let mut mac = HmacSha256::new_varkey(&self.hmac_system_key).unwrap();
             mac.update(&msg);
             let hmac_tag = mac.finalize().into_bytes();
-            let mut msg_clone = msg.clone();
-            msg_clone.extend(hmac_tag); // HMAC TAG
-            tcp_stream.write_all(&msg_clone).await.unwrap();
+            msg.extend(hmac_tag); // HMAC TAG
+            let tcp_stream;
+            {
+                let lock = self.tcp_streams.lock().await;
+                tcp_stream = lock.get(&address).unwrap().clone();
+            }
+            match tcp_stream.lock().await.write_all(&msg).await {
+                Ok(_) => {}
+                Err(_) => {self.tcp_streams.lock().await.remove(&address);}
+            };
         }
     }
 
@@ -1122,21 +1134,12 @@ pub mod register_client_public {
     impl RegisterClient for MyRegisterClient {
 
         async fn send(&self, msg: Send) {
-            let parts = &self.tcp_locations[msg.target - 1];
-            let address = parts.0.clone() + ":" + &parts.1.to_string(); 
-            let mut tcp_stream = TcpStream::connect(&address).await.unwrap();
             let internal = &*(msg.cmd);
             let cmd = RegisterCommand::System(internal.clone());
-            let mut cmd_serialized = cmd_to_u8(&cmd);
+            let cmd_serialized = cmd_to_u8(&cmd);
+            self.send_raw_bytes_no_ack(cmd_serialized.clone(), msg.target).await;
 
-
-            let mut mac = HmacSha256::new_varkey(&self.hmac_system_key).unwrap();
-            mac.update(&cmd_serialized);
-            let hmac_tag = mac.finalize().into_bytes();
-            cmd_serialized.extend(hmac_tag); // HMAC TAG
-
-            tcp_stream.write_all(&cmd_serialized).await.unwrap();
-            self.unanswered_messages.lock().await.insert(msg.cmd.header.msg_ident, msg);
+            self.unanswered_messages.lock().await.insert((msg.target as u8, cmd_serialized[7], msg.cmd.header.msg_ident), msg);
         }
 
         async fn broadcast(&self, msg: Broadcast) {
@@ -1155,9 +1158,9 @@ pub mod register_client_public {
     }
     pub fn build_register_client(hmac_system_key : [u8; 64], tcp_locations : Vec<(String, u16)>) -> Arc<MyRegisterClient> {
         Arc::new(MyRegisterClient {
-            // hmac_client_key,
             hmac_system_key,
             tcp_locations,
+            tcp_streams : Arc::new(Mutex::new(HashMap::new())),
             unanswered_messages : Arc::new(Mutex::new(HashMap::new())),
         })
     }
